@@ -7,13 +7,26 @@ import { sendEmailHTML } from "./emailService.js";
 dotenv.config();
 
 const app = express();
-app.use(express.json());
 
-// CORS
-const ALLOW_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:3000";
-app.use(cors({ origin: [ALLOW_ORIGIN], credentials: true }));
+// Support large JSON payloads (for long transcripts)
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ limit: "10mb", extended: true }));
 
-// Health
+// CORS setup
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:3000";
+app.use(
+  cors({
+    origin: FRONTEND_ORIGIN,
+    credentials: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"]
+  })
+);
+
+// Preflight requests for all routes
+app.options("*", cors());
+
+// Health check
 app.get("/", (_req, res) => res.send("<h1>Backend is running ✅</h1>"));
 
 // AI config
@@ -21,31 +34,30 @@ const USE_MOCK = (process.env.USE_MOCK ?? "true").toLowerCase() === "true";
 const HAS_GROQ = Boolean(process.env.GROQ_API_KEY);
 const groq = HAS_GROQ ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
 
-// Helpers
+// Helper to ensure summary structure
 const ensureSummaryShape = (obj) => ({
   points: Array.isArray(obj?.points) ? obj.points : [],
   decisions: Array.isArray(obj?.decisions) ? obj.decisions : [],
   action_items: Array.isArray(obj?.action_items) ? obj.action_items : []
 });
 
-// Generate Summary
+// Generate Summary endpoint
 app.post("/generate-summary", async (req, res) => {
   const { transcript, instruction } = req.body || {};
   if (!transcript || !instruction) {
     return res.status(400).json({ error: "Transcript and instruction are required" });
   }
 
-  // MOCK
+  // MOCK fallback
   if (USE_MOCK || !groq) {
     const lines = String(transcript)
       .split(/\r?\n|[.?!]\s+/)
       .map((s) => s.trim())
       .filter(Boolean);
 
-    const points = lines.slice(0, 4);
     const summary = ensureSummaryShape({
-      points: points.length
-        ? points
+      points: lines.slice(0, 4).length
+        ? lines.slice(0, 4)
         : [
             "Project timeline and next steps discussed.",
             "Owners assigned to action items.",
@@ -58,10 +70,11 @@ app.post("/generate-summary", async (req, res) => {
         { owner: "Sarah", task: "Design frontend UI", due: "Wednesday" }
       ]
     });
+
     return res.json({ summary });
   }
 
-  // GROQ
+  // GROQ AI
   try {
     const messages = [
       {
@@ -82,7 +95,7 @@ app.post("/generate-summary", async (req, res) => {
     });
 
     let text = completion.choices?.[0]?.message?.content?.trim() || "{}";
-    text = text.replace(/^```json\s*|\s*```$/g, ""); // strip fences if present
+    text = text.replace(/^```json\s*|\s*```$/g, ""); // remove code fences
     const json = JSON.parse(text);
     return res.json({ summary: ensureSummaryShape(json) });
   } catch (e) {
@@ -98,7 +111,7 @@ app.post("/generate-summary", async (req, res) => {
   }
 });
 
-// Send Summary (Ethereal)
+// Send Summary endpoint (mock email)
 app.post("/send-summary", async (req, res) => {
   const rawSummary = req.body?.summary || {};
   const recipients = req.body?.recipients || [];
@@ -108,26 +121,17 @@ app.post("/send-summary", async (req, res) => {
     return res.status(400).json({ error: "Recipients array is required" });
   }
 
-  const bullets = summary.points.map((p) => `<li>${String(p)}</li>`).join("");
+  const bullets = summary.points.map((p) => `<li>${p}</li>`).join("");
   const decisionsHTML = summary.decisions.length
     ? `<h4>Decisions</h4><ul>${summary.decisions.map((d) => `<li>${d}</li>`).join("")}</ul>`
     : "";
   const actionsHTML = summary.action_items.length
     ? `<h4>Action Items</h4><ul>${summary.action_items
-        .map(
-          (a) =>
-            `<li><strong>${a.owner || "Owner"}</strong>: ${a.task || ""} — <em>${a.due || ""}</em></li>`
-        )
+        .map((a) => `<li><strong>${a.owner || "Owner"}</strong>: ${a.task || ""} — <em>${a.due || ""}</em></li>`)
         .join("")}</ul>`
     : "";
 
-  const html = `
-    <h2>Meeting Summary</h2>
-    <h4>Key Points</h4>
-    <ul>${bullets}</ul>
-    ${decisionsHTML}
-    ${actionsHTML}
-  `;
+  const html = `<h2>Meeting Summary</h2><h4>Key Points</h4><ul>${bullets}</ul>${decisionsHTML}${actionsHTML}`;
 
   try {
     const previewUrl = await sendEmailHTML(recipients, "Meeting Summary", html);
@@ -138,6 +142,6 @@ app.post("/send-summary", async (req, res) => {
   }
 });
 
-// Start
+// Start server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Backend running on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Backend running on port ${PORT}`));
