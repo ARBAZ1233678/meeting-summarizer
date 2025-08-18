@@ -15,7 +15,8 @@ export default function Home() {
   const [previewUrl, setPreviewUrl] = useState("");
   const [emailStatus, setEmailStatus] = useState(""); // ✅ new state
 
-  const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://meeting-summarizer-w2et.onrender.com";
+
 
   const onUploadTxt = (file) => {
     const reader = new FileReader();
