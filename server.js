@@ -8,49 +8,34 @@ import { sendEmailHTML } from "./emailService.js";
 dotenv.config();
 const app = express();
 
-/* ---------------- CORS ----------------
-   OPTION A (open to all): leave FRONTEND_ORIGINS unset/empty.
-   OPTION B (allow-list): set FRONTEND_ORIGINS to comma-separated origins, e.g.
-   FRONTEND_ORIGINS=https://meeting-summarizer-k4eb.vercel.app,http://localhost:3000
-*/
-const ALLOWLIST = (process.env.FRONTEND_ORIGINS || "")
+// ---------- CORS ----------
+const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// If you don’t set FRONTEND_ORIGINS, allow all (we’re not using cookies)
 const corsOptions = {
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);              // server-to-server
-    if (ALLOWLIST.length === 0) return cb(null, true); // allow all if none configured
-    if (ALLOWLIST.includes(origin)) return cb(null, true);
-    return cb(null, false);                          // politely deny (no crash/log spam)
-  },
-  credentials: false, // we're not using cookies; simpler
+  origin: FRONTEND_ORIGINS.length ? FRONTEND_ORIGINS : true,
+  credentials: false,
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
-  maxAge: 86400, // cache preflight for a day
+  maxAge: 86400
 };
+app.use(cors(corsOptions)); // handles preflight too
 
-app.use(cors(corsOptions));
-
-// IMPORTANT: In Express 5, DO NOT use "*" as a path (causes path-to-regexp error).
-// Use a RegExp to handle all preflights:
-app.options(/.*/, cors(corsOptions));
-
-/* ------------- Body parsing ------------- */
+// ---------- Body parsing ----------
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ limit: "10mb", extended: true }));
 
-/* ------------- Health ------------- */
+// ---------- Health ----------
 app.get("/", (_req, res) => res.send("<h1>Backend is running ✅</h1>"));
 
-/* ------------- Config / helpers ------------- */
-const parseBool = (val, def = true) => {
-  if (val === undefined || val === null || val === "") return def;
-  return ["true", "1", "yes"].includes(String(val).toLowerCase());
-};
+// ---------- Config ----------
+const parseBool = (val, defaultVal = false) =>
+  val == null ? defaultVal : ["true", "1", "yes"].includes(String(val).toLowerCase());
 
-const USE_MOCK = parseBool(process.env.USE_MOCK, true);
+const USE_MOCK = parseBool(process.env.USE_MOCK, false); // DEFAULT NOW FALSE
 const HAS_GROQ = Boolean(process.env.GROQ_API_KEY);
 const groq = HAS_GROQ ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
 
@@ -61,12 +46,12 @@ const ensureSummaryShape = (obj) => ({
     ? obj.action_items.map((a) => ({
         owner: a?.owner || "Unassigned",
         task: a?.task || "",
-        due: a?.due || "",
+        due: a?.due || ""
       }))
-    : [],
+    : []
 });
 
-/* ------------- Routes ------------- */
+// ---------- Routes ----------
 app.post("/generate-summary", async (req, res) => {
   try {
     const { transcript, instruction } = req.body || {};
@@ -74,58 +59,76 @@ app.post("/generate-summary", async (req, res) => {
       return res.status(400).json({ error: "Transcript and instruction are required" });
     }
 
-    // Mock path (default until GROQ_API_KEY provided and USE_MOCK=false)
-    if (USE_MOCK || !groq) {
-      const lines = String(transcript)
-        .split(/\r?\n|[.?!]\s+/)
-        .map((s) => s.trim())
-        .filter(Boolean);
+    // Mock mode (explicit only)
+    if (USE_MOCK) {
+      console.log("[generate-summary] MODE=mock");
+      const lines = String(transcript).split(/\r?\n|[.?!]\s+/).map((s) => s.trim()).filter(Boolean);
+
+      // Make the mock a bit smarter (reflect the instruction a little)
+      const points = lines
+        .filter((l) => !/^\s*\.\.\.\s*$/.test(l))
+        .slice(0, 8);
 
       const summary = ensureSummaryShape({
-        points: lines.slice(0, 6),
-        decisions: ["Proceed with current timeline."],
-        action_items: [
-          { owner: "John", task: "Finish API integration", due: "Friday" },
-          { owner: "Sarah", task: "Design frontend UI", due: "Wednesday" },
-        ],
+        points,
+        decisions: points.some((p) => /demo|approve|decision|agree/i.test(p))
+          ? ["Stakeholders aligned on next steps."]
+          : [],
+        action_items: points
+          .filter((p) => /by (monday|tuesday|wednesday|thursday|friday)|due|deliver|send/i.test(p))
+          .slice(0, 3)
+          .map((p, i) => ({ owner: ["John", "Sarah", "Alex"][i] || "Owner", task: p, due: "" }))
       });
 
       return res.json({ summary });
     }
 
-    // Groq path
+    // Real Groq mode
+    if (!groq) {
+      return res.status(500).json({
+        error: "GROQ_API_KEY not configured. Set USE_MOCK=true to test without LLM."
+      });
+    }
+
+    console.log("[generate-summary] MODE=groq");
+
     const messages = [
       {
         role: "system",
         content:
-          "You are a meeting notes summarizer. Output STRICT JSON only with keys: points (string[]), decisions (string[]), action_items (array of {owner, task, due}). No prose or markdown.",
+          "You are a meeting notes summarizer. Output STRICT JSON with keys: " +
+          "points (string[]), decisions (string[]), action_items (array of {owner, task, due}). " +
+          "Do NOT output prose or markdown. Only JSON."
       },
       {
         role: "user",
-        content: `Instruction: ${instruction}\n\nTranscript:\n${transcript}\n\nReturn STRICT JSON only.`,
-      },
+        content:
+          `Instruction: ${instruction}\n\nTranscript:\n${transcript}\n\n` +
+          "Return STRICT JSON only. Example output:\n" +
+          `{"points":["..."],"decisions":["..."],"action_items":[{"owner":"Name","task":"Task","due":"Date"}]}`
+      }
     ];
 
     const completion = await groq.chat.completions.create({
-      model: "llama-3.1-8b-instant",
+      model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
       messages,
-      temperature: 0.2,
+      temperature: 0.2
     });
 
     let text = completion.choices?.[0]?.message?.content?.trim() || "{}";
-    text = text.replace(/^```json\s*|\s*```$/g, ""); // strip code fences if present
+    text = text.replace(/^```json\s*|\s*```$/g, ""); // strip fenced blocks if present
 
     let json;
     try {
       json = JSON.parse(text);
     } catch (e) {
-      console.error("Invalid JSON from Groq:", text);
-      return res.status(500).json({ error: "Groq returned invalid JSON" });
+      console.error("Groq returned invalid JSON:", text);
+      return res.status(502).json({ error: "Groq returned invalid JSON" });
     }
 
     return res.json({ summary: ensureSummaryShape(json) });
   } catch (err) {
-    console.error("generate-summary error:", err.message);
+    console.error("generate-summary error:", err);
     return res.status(500).json({ error: "Failed to generate summary (server error)" });
   }
 });
@@ -135,7 +138,6 @@ app.post("/send-summary", async (req, res) => {
     const rawSummary = req.body?.summary || {};
     const recipients = req.body?.recipients || [];
     const summary = ensureSummaryShape(rawSummary);
-
     if (!recipients.length) {
       return res.status(400).json({ error: "Recipients array is required" });
     }
@@ -155,11 +157,11 @@ app.post("/send-summary", async (req, res) => {
     const previewUrl = await sendEmailHTML(recipients, "Meeting Summary", html);
     return res.json({ message: "Email sent (preview available)", previewUrl });
   } catch (err) {
-    console.error("send-summary error:", err.message);
+    console.error("send-summary error:", err);
     return res.status(500).json({ error: "Failed to send summary" });
   }
 });
 
-/* ------------- Start ------------- */
+// ---------- Start ----------
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Backend running on port ${PORT}`));
